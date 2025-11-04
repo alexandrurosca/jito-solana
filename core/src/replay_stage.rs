@@ -75,8 +75,7 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
     solana_transaction::Transaction,
-    solana_vote_program::vote_state::TowerSync,
-    solana_vote_interface::state::VoteStateUpdate,
+    solana_vote_program::vote_state::VoteStateUpdate,
     solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
