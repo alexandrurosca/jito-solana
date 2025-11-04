@@ -616,6 +616,11 @@ impl Tower {
     pub fn record_bank_vote(&mut self, bank: &Bank) -> Option<Slot> {
         // Returns the new root if one is made after applying a vote for the given bank to
         // `self.vote_state`
+        info!(
+            "record_bank_vote: slot {} last_voted_slot {:?}",
+            bank.slot(),
+            self.last_voted_slot()
+        );
         let block_id = bank.block_id().unwrap_or_else(|| {
             // This can only happen for our leader bank
             // Note: since the new shred format is yet to be rolled out to all clusters,
@@ -623,51 +628,8 @@ impl Tower {
             // here that this is our leader bank.
             Hash::default()
         });
-        // Backfill recent ancestor slots on the current fork before recording this vote.
-        // This helps recover vote credits when rejoining the heaviest fork by including
-        // missed recent ancestors in the next VoteStateUpdate/TowerSync.
-        if let Some(mut parent_bank) = bank.parent() {
-            let last_voted_slot = self.last_voted_slot();
-            let mut backfill_slots: Vec<Slot> = Vec::new();
-
-            // Collect contiguous ancestors that are newer than our last voted slot.
-            loop {
-                let s = parent_bank.slot();
-                if last_voted_slot.is_some_and(|lv| s <= lv) {
-                    break;
-                }
-                backfill_slots.push(s);
-                if let Some(next_parent) = parent_bank.parent() {
-                    parent_bank = next_parent;
-                } else {
-                    break;
-                }
-            }
-
-            if !backfill_slots.is_empty() {
-                info!(
-                    "vote backfill: adding {} ancestor slots before voting on {} (last_voted_slot: {:?}, range: {}..={})",
-                    backfill_slots.len(),
-                    bank.slot(),
-                    last_voted_slot,
-                    backfill_slots.first().unwrap(),
-                    backfill_slots.last().unwrap()
-                );
-                debug!("vote backfill slots: {:?}", backfill_slots);
-            } else {
-                trace!(
-                    "vote backfill: no ancestors to backfill before voting on {} (last_voted_slot: {:?})",
-                    bank.slot(),
-                    last_voted_slot
-                );
-            }
-
-            // Apply in ascending order to maintain correct lockout progression.
-            backfill_slots.reverse();
-            for s in backfill_slots {
-                self.vote_state.process_next_vote_slot(s);
-            }
-        }
+        // Note: vote backfill is performed at vote construction time based on
+        // the on-chain landed last vote; we do not mutate the local tower here.
         self.record_bank_vote_and_update_lockouts(
             bank.slot(),
             bank.hash(),

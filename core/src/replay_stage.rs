@@ -2537,12 +2537,74 @@ impl ReplayStage {
 
         // Send our last few votes along with the new one
         // Compact the vote state update before sending
-        let vote = match vote {
+        let mut vote = match vote {
             VoteTransaction::VoteStateUpdate(vote_state_update) => {
                 VoteTransaction::CompactVoteStateUpdate(vote_state_update)
             }
             vote => vote,
         };
+        // Rebuild vote contents based on on-chain landed last vote, to include missing
+        // ancestor slots ("backfilling") when possible via TowerSync.
+        let enable_tower_sync_ix = bank
+            .feature_set
+            .is_active(&agave_feature_set::enable_tower_sync_ix::id());
+        if enable_tower_sync_ix {
+            if let Some(landed_last_voted_slot) = vote_state_view.last_voted_slot() {
+                let mut backfill_slots: Vec<Slot> = Vec::new();
+                if let Some(mut parent_bank) = bank.parent() {
+                    loop {
+                        let s = parent_bank.slot();
+                        if s <= landed_last_voted_slot {
+                            break;
+                        }
+                        backfill_slots.push(s);
+                        if let Some(next_parent) = parent_bank.parent() {
+                            parent_bank = next_parent;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                if !backfill_slots.is_empty() {
+                    info!(
+                        "vote backfill (on-chain): landed_last_voted_slot {:?}, adding {} ancestor slots before voting on {} (range: {}..={}; root: {:?})",
+                        landed_last_voted_slot,
+                        backfill_slots.len(),
+                        bank.slot(),
+                        backfill_slots.first().unwrap(),
+                        backfill_slots.last().unwrap(),
+                        vote_state_view.root_slot()
+                    );
+                    debug!("vote backfill (on-chain) slots: {:?}", backfill_slots);
+                    backfill_slots.reverse();
+                    backfill_slots.push(bank.slot());
+                    let tower_sync = solana_vote_interface::state::TowerSync::new_from_slots(
+                        backfill_slots,
+                        bank.hash(),
+                        vote_state_view.root_slot(),
+                    );
+                    vote = VoteTransaction::from(tower_sync);
+                } else {
+                    trace!(
+                        "vote backfill (on-chain): no ancestors to backfill for bank {} (landed_last_voted_slot: {:?})",
+                        bank.slot(),
+                        landed_last_voted_slot
+                    );
+                }
+            } else {
+                // No landed votes yet; optionally include just current slot via existing vote.
+            }
+        }
+        let vote_slots = vote.slots();
+        info!(
+            "generate_vote_tx: building vote for bank {} (decision: {:?}) with {} slots (range: {}..={})",
+            bank.slot(),
+            switch_fork_decision,
+            vote_slots.len(),
+            vote_slots.first().unwrap_or(&0),
+            vote_slots.last().unwrap_or(&0)
+        );
+        debug!("generate_vote_tx slots: {:?}", vote_slots);
         let vote_ix = switch_fork_decision
             .to_vote_instruction(
                 vote,
