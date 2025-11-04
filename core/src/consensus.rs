@@ -623,6 +623,33 @@ impl Tower {
             // here that this is our leader bank.
             Hash::default()
         });
+        // Backfill recent ancestor slots on the current fork before recording this vote.
+        // This helps recover vote credits when rejoining the heaviest fork by including
+        // missed recent ancestors in the next VoteStateUpdate/TowerSync.
+        if let Some(mut parent_bank) = bank.parent() {
+            let last_voted_slot = self.last_voted_slot();
+            let mut backfill_slots: Vec<Slot> = Vec::new();
+
+            // Collect contiguous ancestors that are newer than our last voted slot.
+            loop {
+                let s = parent_bank.slot();
+                if last_voted_slot.is_some_and(|lv| s <= lv) {
+                    break;
+                }
+                backfill_slots.push(s);
+                if let Some(next_parent) = parent_bank.parent() {
+                    parent_bank = next_parent;
+                } else {
+                    break;
+                }
+            }
+
+            // Apply in ascending order to maintain correct lockout progression.
+            backfill_slots.reverse();
+            for s in backfill_slots {
+                self.vote_state.process_next_vote_slot(s);
+            }
+        }
         self.record_bank_vote_and_update_lockouts(
             bank.slot(),
             bank.hash(),
