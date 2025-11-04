@@ -75,6 +75,7 @@ use {
     solana_svm_timings::ExecuteTimings,
     solana_time_utils::timestamp,
     solana_transaction::Transaction,
+    solana_vote_program::vote_state::TowerSync,
     solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
@@ -2578,7 +2579,7 @@ impl ReplayStage {
                     debug!("vote backfill (on-chain) slots: {:?}", backfill_slots);
                     backfill_slots.reverse();
                     backfill_slots.push(bank.slot());
-                    let tower_sync = solana_vote_interface::state::TowerSync::new_from_slots(
+                    let tower_sync = TowerSync::new_from_slots(
                         backfill_slots,
                         bank.hash(),
                         vote_state_view.root_slot(),
