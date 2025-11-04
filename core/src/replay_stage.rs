@@ -76,6 +76,7 @@ use {
     solana_time_utils::timestamp,
     solana_transaction::Transaction,
     solana_vote_program::vote_state::TowerSync,
+    solana_vote_interface::state::VoteStateUpdate,
     solana_vote::vote_transaction::VoteTransaction,
     std::{
         collections::{HashMap, HashSet},
@@ -2577,14 +2578,19 @@ impl ReplayStage {
                         vote_state_view.root_slot()
                     );
                     debug!("vote backfill (on-chain) slots: {:?}", backfill_slots);
+                    // Build a temporary tower from on-chain vote state and extend it with backfill + current slot
                     backfill_slots.reverse();
-                    backfill_slots.push(bank.slot());
-                    let tower_sync = TowerSync::new_from_slots(
-                        backfill_slots,
+                    let mut tmp_tower = TowerVoteState::from(vote_state_view);
+                    for s in &backfill_slots {
+                        tmp_tower.process_next_vote_slot(*s);
+                    }
+                    tmp_tower.process_next_vote_slot(bank.slot());
+                    let vsu = VoteStateUpdate::new(
+                        tmp_tower.votes.clone(),
+                        tmp_tower.root_slot,
                         bank.hash(),
-                        vote_state_view.root_slot(),
                     );
-                    vote = VoteTransaction::from(tower_sync);
+                    vote = VoteTransaction::CompactVoteStateUpdate(vsu);
                 } else {
                     trace!(
                         "vote backfill (on-chain): no ancestors to backfill for bank {} (landed_last_voted_slot: {:?})",
