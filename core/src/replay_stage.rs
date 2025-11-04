@@ -2399,6 +2399,27 @@ impl ReplayStage {
             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
         }
         trace!("handle votable bank {}", bank.slot());
+        // Progress-aware backfill: if our latest landed vote on this fork lags the
+        // parent chain, pre-apply the missing ancestor slots to the local tower so the
+        // next VoteStateUpdate includes them. This helps recover missed votes when
+        // returning to the main fork or when a prior vote failed to land.
+        if let Some(latest_landed_on_same_fork) = progress.my_latest_landed_vote(bank.slot()) {
+            if let Some(mut parent_bank) = bank.parent() {
+                if parent_bank.slot() > latest_landed_on_same_fork {
+                    let mut to_backfill: Vec<Slot> = Vec::new();
+                    loop {
+                        let s = parent_bank.slot();
+                        if s <= latest_landed_on_same_fork { break; }
+                        to_backfill.push(s);
+                        if let Some(next_parent) = parent_bank.parent() {
+                            parent_bank = next_parent;
+                        } else { break; }
+                    }
+                    to_backfill.reverse();
+                    for s in to_backfill { tower.vote_state.process_next_vote_slot(s); }
+                }
+            }
+        }
         let new_root = tower.record_bank_vote(bank);
 
         if let Some(new_root) = new_root {
