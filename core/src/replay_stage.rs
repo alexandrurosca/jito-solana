@@ -2566,9 +2566,12 @@ impl ReplayStage {
             vote => vote,
         };
         // Rebuild vote contents based on on-chain landed last vote to include
-        // any missing ancestor slots ("backfilling"). This does not require
-        // the TowerSync feature because we send a CompactVoteStateUpdate.
-        if let Some(landed_last_voted_slot) = vote_state_view.last_voted_slot() {
+        // any missing ancestor slots ("backfilling").
+        let enable_tower_sync_ix = bank
+            .feature_set
+            .is_active(&agave_feature_set::enable_tower_sync_ix::id());
+        if enable_tower_sync_ix {
+            if let Some(landed_last_voted_slot) = vote_state_view.last_voted_slot() {
                 let mut backfill_slots: Vec<Slot> = Vec::new();
                 if let Some(mut parent_bank) = bank.parent() {
                     loop {
@@ -2615,8 +2618,9 @@ impl ReplayStage {
                         landed_last_voted_slot
                     );
                 }
-        } else {
-            // No landed votes yet; optionally include just current slot via existing vote.
+            } else {
+                // No landed votes yet; optionally include just current slot via existing vote.
+            }
         }
         let vote_slots = vote.slots();
         info!(
