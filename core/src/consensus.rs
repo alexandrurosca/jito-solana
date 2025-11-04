@@ -644,6 +644,24 @@ impl Tower {
                 }
             }
 
+            if !backfill_slots.is_empty() {
+                info!(
+                    "vote backfill: adding {} ancestor slots before voting on {} (last_voted_slot: {:?}, range: {}..={})",
+                    backfill_slots.len(),
+                    bank.slot(),
+                    last_voted_slot,
+                    backfill_slots.first().unwrap(),
+                    backfill_slots.last().unwrap()
+                );
+                debug!("vote backfill slots: {:?}", backfill_slots);
+            } else {
+                trace!(
+                    "vote backfill: no ancestors to backfill before voting on {} (last_voted_slot: {:?})",
+                    bank.slot(),
+                    last_voted_slot
+                );
+            }
+
             // Apply in ascending order to maintain correct lockout progression.
             backfill_slots.reverse();
             for s in backfill_slots {
