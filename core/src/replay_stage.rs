@@ -352,6 +352,11 @@ impl VoteBackfill {
             return vec![vote_bank.clone()];
         };
 
+        info!(
+            "vote backfill: anchor slot {} identified as mostly confirmed",
+            mostly_confirmed_bank.slot()
+        );
+
         let mut candidates = Vec::new();
 
         if let Some(last_voted_slot) = tower.vote_state.last_voted_slot() {
@@ -401,6 +406,10 @@ impl VoteBackfill {
         if filtered.is_empty() {
             vec![vote_bank.clone()]
         } else {
+            let slots: Vec<_> = filtered.iter().map(|bank| bank.slot()).collect();
+            if slots.len() > 1 {
+                info!("vote backfill: prepared vote window {:?}", slots);
+            }
             filtered
         }
     }
@@ -485,7 +494,18 @@ impl VoteBackfill {
             return false;
         };
 
-        (*stake as f64 / fork_stats.total_stake as f64) >= self.threshold
+        let ratio = *stake as f64 / fork_stats.total_stake as f64;
+        let meets_threshold = ratio >= self.threshold;
+        if meets_threshold && !fork_stats.is_mostly_confirmed {
+            info!(
+                "vote backfill: slot {} reached {:.2}% stake (threshold {:.2}%)",
+                slot,
+                ratio * 100.0,
+                self.threshold * 100.0,
+            );
+        }
+
+        meets_threshold
     }
 }
 
@@ -1196,6 +1216,18 @@ impl ReplayStage {
                         } else {
                             &same_fork_decision
                         };
+
+                        if !should_push_vote {
+                            info!(
+                                "vote backfill: applying catch-up vote for slot {}",
+                                bank.slot()
+                            );
+                        } else if vote_banks.len() > 1 {
+                            info!(
+                                "vote backfill: submitting final vote for slot {}",
+                                bank.slot()
+                            );
+                        }
 
                         if let Err(e) = Self::handle_votable_bank(
                             bank,
