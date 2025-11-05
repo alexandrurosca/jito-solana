@@ -2598,16 +2598,31 @@ impl ReplayStage {
                         vote_state_view.root_slot()
                     );
                     debug!("vote backfill (on-chain) slots: {:?}", backfill_slots);
-                    // Build a temporary tower from on-chain vote state and extend it with backfill + current slot
-                    backfill_slots.reverse();
-                    let mut tmp_tower = TowerVoteState::from(vote_state_view);
-                    for s in &backfill_slots {
-                        tmp_tower.process_next_vote_slot(*s);
+                    // Sticky-carry lockouts: start from on-chain landed lockouts, add backfill
+                    // ancestors and the current slot, then let the program reconcile.
+                    use std::collections::VecDeque;
+                    let mut combined: Vec<solana_vote_program::vote_state::Lockout> =
+                        vote_state_view.votes_iter().collect();
+                    for s in backfill_slots.into_iter().rev() {
+                        combined.push(solana_vote_program::vote_state::Lockout::new(s));
                     }
-                    tmp_tower.process_next_vote_slot(bank.slot());
+                    combined.push(solana_vote_program::vote_state::Lockout::new(bank.slot()));
+                    // Dedup by slot and sort ascending
+                    combined.sort_by_key(|l| l.slot());
+                    combined.dedup_by_key(|l| l.slot());
+                    // Drop anything at/below root
+                    if let Some(root) = vote_state_view.root_slot() {
+                        combined.retain(|l| l.slot() > root);
+                    }
+                    // Cap to MAX_LOCKOUT_HISTORY (keep most recent)
+                    let max_len = solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY;
+                    if combined.len() > max_len {
+                        let start = combined.len() - max_len;
+                        combined = combined.split_off(start);
+                    }
                     let vsu = VoteStateUpdate::new(
-                        tmp_tower.votes.clone(),
-                        tmp_tower.root_slot,
+                        VecDeque::from(combined),
+                        vote_state_view.root_slot(),
                         bank.hash(),
                     );
                     vote = VoteTransaction::CompactVoteStateUpdate(vsu);
