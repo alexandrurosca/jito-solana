@@ -2601,24 +2601,38 @@ impl ReplayStage {
                     // Sticky-carry lockouts: start from on-chain landed lockouts, add backfill
                     // ancestors and the current slot, then let the program reconcile.
                     use std::collections::VecDeque;
-                    let mut combined: Vec<solana_vote_program::vote_state::Lockout> =
-                        vote_state_view.votes_iter().collect();
+                    // Start from on-chain slots only (ignore their original confirmation counts)
+                    let mut combined_slots: Vec<Slot> =
+                        vote_state_view.votes_iter().map(|l| l.slot()).collect();
                     for s in backfill_slots.into_iter().rev() {
-                        combined.push(solana_vote_program::vote_state::Lockout::new(s));
+                        combined_slots.push(s);
                     }
-                    combined.push(solana_vote_program::vote_state::Lockout::new(bank.slot()));
+                    combined_slots.push(bank.slot());
                     // Dedup by slot and sort ascending
-                    combined.sort_by_key(|l| l.slot());
-                    combined.dedup_by_key(|l| l.slot());
+                    combined_slots.sort_unstable();
+                    combined_slots.dedup();
                     // Drop anything at/below root
                     if let Some(root) = vote_state_view.root_slot() {
-                        combined.retain(|l| l.slot() > root);
+                        combined_slots.retain(|s| *s > root);
                     }
                     // Cap to MAX_LOCKOUT_HISTORY (keep most recent)
                     let max_len = solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY;
-                    if combined.len() > max_len {
-                        let start = combined.len() - max_len;
-                        combined = combined.split_off(start);
+                    if combined_slots.len() > max_len {
+                        let start = combined_slots.len() - max_len;
+                        combined_slots = combined_slots.split_off(start);
+                    }
+                    // Recompute confirmation counts as if none were popped: earliest gets
+                    // highest confirmation_count, latest gets 1. This keeps older slots sticky.
+                    let total = combined_slots.len();
+                    let mut combined: Vec<solana_vote_program::vote_state::Lockout> =
+                        Vec::with_capacity(total);
+                    for (idx, s) in combined_slots.iter().enumerate() {
+                        let conf = (total - idx) as u32; // earliest highest
+                        combined.push(
+                            solana_vote_program::vote_state::Lockout::new_with_confirmation_count(
+                                *s, conf,
+                            ),
+                        );
                     }
                     let vsu = VoteStateUpdate::new(
                         VecDeque::from(combined),
