@@ -616,6 +616,11 @@ impl Tower {
     pub fn record_bank_vote(&mut self, bank: &Bank) -> Option<Slot> {
         // Returns the new root if one is made after applying a vote for the given bank to
         // `self.vote_state`
+        info!(
+            "record_bank_vote: slot {} last_voted_slot {:?}",
+            bank.slot(),
+            self.last_voted_slot()
+        );
         let block_id = bank.block_id().unwrap_or_else(|| {
             // This can only happen for our leader bank
             // Note: since the new shred format is yet to be rolled out to all clusters,
@@ -623,6 +628,8 @@ impl Tower {
             // here that this is our leader bank.
             Hash::default()
         });
+        // Note: vote backfill is performed at vote construction time based on
+        // the on-chain landed last vote; we do not mutate the local tower here.
         self.record_bank_vote_and_update_lockouts(
             bank.slot(),
             bank.hash(),
