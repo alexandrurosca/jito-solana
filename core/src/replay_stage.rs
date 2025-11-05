@@ -13,7 +13,7 @@ use {
             fork_choice::{select_vote_and_reset_forks, ForkChoice, SelectVoteAndResetForkResult},
             heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
             latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-            progress_map::{ForkProgress, ProgressMap, PropagatedStats},
+            progress_map::{ForkProgress, ForkStats, ProgressMap, PropagatedStats},
             tower_storage::{SavedTower, SavedTowerVersions, TowerStorage},
             tower_vote_state::TowerVoteState,
             BlockhashStatus, ComputedBankState, Stake, SwitchForkDecision, Tower, TowerError,
@@ -312,6 +312,181 @@ pub struct ReplayReceivers {
     pub duplicate_confirmed_slots_receiver: Receiver<Vec<(u64, Hash)>>,
     pub gossip_verified_vote_hash_receiver: Receiver<(Pubkey, u64, Hash)>,
     pub popular_pruned_forks_receiver: Receiver<Vec<u64>>,
+}
+
+const VOTE_BACKFILL_THRESHOLD: f64 = 0.45;
+const VOTE_BACKFILL_AHEAD_COUNT: usize = 4;
+
+#[derive(Clone)]
+struct VoteBackfill {
+    enabled: bool,
+    threshold: f64,
+    ahead_count: usize,
+}
+
+impl Default for VoteBackfill {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold: VOTE_BACKFILL_THRESHOLD,
+            ahead_count: VOTE_BACKFILL_AHEAD_COUNT,
+        }
+    }
+}
+
+impl VoteBackfill {
+    fn collect_vote_banks(
+        &self,
+        tower: &Tower,
+        vote_bank: &Arc<Bank>,
+        progress: &ProgressMap,
+        ancestors: &HashMap<Slot, HashSet<Slot>>,
+    ) -> Vec<Arc<Bank>> {
+        if !self.enabled {
+            return vec![vote_bank.clone()];
+        }
+
+        let Some(mostly_confirmed_bank) =
+            self.first_mostly_confirmed_bank(vote_bank.clone(), progress)
+        else {
+            return vec![vote_bank.clone()];
+        };
+
+        let mut candidates = Vec::new();
+
+        if let Some(last_voted_slot) = tower.vote_state.last_voted_slot() {
+            if let Some(parent) = mostly_confirmed_bank.parent() {
+                candidates.extend(Self::banks_between_and_including(
+                    last_voted_slot.saturating_add(1),
+                    parent.clone(),
+                ));
+            }
+        }
+
+        let mut forward_banks =
+            Self::banks_between_and_including(mostly_confirmed_bank.slot(), vote_bank.clone());
+        if forward_banks.len() > self.ahead_count {
+            forward_banks.truncate(self.ahead_count);
+        }
+        candidates.extend(forward_banks);
+
+        if candidates.is_empty() {
+            return vec![vote_bank.clone()];
+        }
+
+        candidates.sort_by_key(|bank| bank.slot());
+        candidates.dedup_by_key(|bank| bank.slot());
+
+        let mut filtered = Vec::new();
+        let mut simulated_state = tower.vote_state.clone();
+        for bank in candidates {
+            if let Some(last_voted) = simulated_state.last_voted_slot() {
+                if bank.slot() <= last_voted {
+                    continue;
+                }
+            }
+
+            let Some(ancestor_set) = ancestors.get(&bank.slot()) else {
+                continue;
+            };
+
+            if Self::would_be_locked_out(&simulated_state, bank.slot(), ancestor_set) {
+                continue;
+            }
+
+            simulated_state.process_next_vote_slot(bank.slot());
+            filtered.push(bank);
+        }
+
+        if filtered.is_empty() {
+            vec![vote_bank.clone()]
+        } else {
+            filtered
+        }
+    }
+
+    fn first_mostly_confirmed_bank(
+        &self,
+        bank: Arc<Bank>,
+        progress: &ProgressMap,
+    ) -> Option<Arc<Bank>> {
+        if progress
+            .get_fork_stats(bank.slot())
+            .map(|stats| stats.is_mostly_confirmed)
+            .unwrap_or(false)
+        {
+            Some(bank)
+        } else {
+            bank.parent()
+                .and_then(|parent| self.first_mostly_confirmed_bank(parent.clone(), progress))
+        }
+    }
+
+    fn banks_between_and_including(start_slot: Slot, last_bank: Arc<Bank>) -> Vec<Arc<Bank>> {
+        let mut banks = Vec::new();
+        let mut current = last_bank;
+
+        loop {
+            if current.slot() < start_slot {
+                break;
+            }
+
+            banks.push(current.clone());
+
+            if let Some(parent) = current.parent() {
+                current = parent.clone();
+            } else {
+                break;
+            }
+        }
+
+        banks.into_iter().rev().collect()
+    }
+
+    fn would_be_locked_out(
+        vote_state: &TowerVoteState,
+        slot: Slot,
+        ancestors: &HashSet<Slot>,
+    ) -> bool {
+        let mut vote_state = vote_state.clone();
+        vote_state.process_next_vote_slot(slot);
+        for vote in &vote_state.votes {
+            if slot != vote.slot() && !ancestors.contains(&vote.slot()) {
+                return true;
+            }
+        }
+        if let Some(root_slot) = vote_state.root_slot {
+            if slot != root_slot && !ancestors.contains(&root_slot) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn is_slot_mostly_confirmed(
+        &self,
+        slot: Slot,
+        fork_stats: &ForkStats,
+        bank_forks: &BankForks,
+    ) -> bool {
+        if !self.enabled || fork_stats.total_stake == 0 {
+            return false;
+        }
+
+        let Some(bank) = bank_forks.get(slot) else {
+            return false;
+        };
+
+        if !bank.is_frozen() {
+            return false;
+        }
+
+        let Some(stake) = fork_stats.voted_stakes.get(&slot) else {
+            return false;
+        };
+
+        (*stake as f64 / fork_stats.total_stake as f64) >= self.threshold
+    }
 }
 
 /// Timing information for the ReplayStage main processing loop
@@ -661,6 +836,7 @@ impl ReplayStage {
             let mut partition_info = PartitionInfo::new();
             let mut skipped_slots_info = SkippedSlotsInfo::default();
             let mut replay_timing = ReplayLoopTiming::default();
+            let vote_backfill = VoteBackfill::default();
             let duplicate_slots_tracker = DuplicateSlotsTracker::default();
             let duplicate_confirmed_slots = DuplicateConfirmedSlots::default();
             let epoch_slots_frozen_slots = EpochSlotsFrozenSlots::default();
@@ -893,14 +1069,28 @@ impl ReplayStage {
 
                 let mut compute_slot_stats_time = Measure::start("compute_slot_stats_time");
                 for slot in newly_computed_slot_stats {
-                    let fork_stats = progress.get_fork_stats(slot).unwrap();
-                    let duplicate_confirmed_forks = Self::tower_duplicate_confirmed_forks(
-                        &tower,
-                        &fork_stats.voted_stakes,
-                        fork_stats.total_stake,
-                        &progress,
-                        &bank_forks,
-                    );
+                    let duplicate_confirmed_forks = {
+                        let fork_stats = progress.get_fork_stats(slot).unwrap();
+                        Self::tower_duplicate_confirmed_forks(
+                            &tower,
+                            &fork_stats.voted_stakes,
+                            fork_stats.total_stake,
+                            &progress,
+                            &bank_forks,
+                        )
+                    };
+
+                    if let Some(slot_progress) = progress.get_mut(&slot) {
+                        let is_mostly_confirmed = {
+                            let bank_forks_guard = bank_forks.read().unwrap();
+                            vote_backfill.is_slot_mostly_confirmed(
+                                slot,
+                                &slot_progress.fork_stats,
+                                &bank_forks_guard,
+                            )
+                        };
+                        slot_progress.fork_stats.is_mostly_confirmed = is_mostly_confirmed;
+                    }
 
                     Self::mark_slots_duplicate_confirmed(
                         &duplicate_confirmed_forks,
@@ -993,32 +1183,48 @@ impl ReplayStage {
                         );
                     }
 
-                    if let Err(e) = Self::handle_votable_bank(
-                        vote_bank,
-                        switch_fork_decision,
-                        &bank_forks,
-                        &mut tower,
-                        &mut progress,
-                        &vote_account,
-                        &identity_keypair,
-                        &authorized_voter_keypairs.read().unwrap(),
-                        &blockstore,
-                        &leader_schedule_cache,
-                        &lockouts_sender,
-                        snapshot_controller.as_deref(),
-                        rpc_subscriptions.as_deref(),
-                        &block_commitment_cache,
-                        &bank_notification_sender,
-                        &mut tracked_vote_transactions,
-                        &mut has_new_vote_been_rooted,
-                        &mut replay_timing,
-                        &voting_sender,
-                        &drop_bank_sender,
-                        wait_to_vote_slot,
-                        &mut tbft_structs,
-                    ) {
-                        error!("Unable to set root: {e}");
-                        return;
+                    let vote_banks =
+                        vote_backfill.collect_vote_banks(&tower, vote_bank, &progress, &ancestors);
+                    let authorized_voters_guard = authorized_voter_keypairs.read().unwrap();
+                    let same_fork_decision = SwitchForkDecision::SameFork;
+                    let last_index = vote_banks.len().saturating_sub(1);
+
+                    for (i, bank) in vote_banks.iter().enumerate() {
+                        let should_push_vote = i == last_index;
+                        let decision = if should_push_vote {
+                            switch_fork_decision
+                        } else {
+                            &same_fork_decision
+                        };
+
+                        if let Err(e) = Self::handle_votable_bank(
+                            bank,
+                            decision,
+                            &bank_forks,
+                            &mut tower,
+                            &mut progress,
+                            &vote_account,
+                            &identity_keypair,
+                            &authorized_voters_guard,
+                            &blockstore,
+                            &leader_schedule_cache,
+                            &lockouts_sender,
+                            snapshot_controller.as_deref(),
+                            rpc_subscriptions.as_deref(),
+                            &block_commitment_cache,
+                            &bank_notification_sender,
+                            &mut tracked_vote_transactions,
+                            &mut has_new_vote_been_rooted,
+                            &mut replay_timing,
+                            &voting_sender,
+                            &drop_bank_sender,
+                            wait_to_vote_slot,
+                            &mut tbft_structs,
+                            should_push_vote,
+                        ) {
+                            error!("Unable to set root: {e}");
+                            return;
+                        }
                     }
                 }
                 voting_time.stop();
@@ -2393,6 +2599,7 @@ impl ReplayStage {
         drop_bank_sender: &Sender<Vec<BankWithScheduler>>,
         wait_to_vote_slot: Option<Slot>,
         tbft_structs: &mut TowerBFTStructures,
+        should_push_vote: bool,
     ) -> Result<(), SetRootError> {
         if bank.is_empty() {
             datapoint_info!("replay_stage-voted_empty_bank", ("slot", bank.slot(), i64));
@@ -2454,19 +2661,21 @@ impl ReplayStage {
         update_commitment_cache_time.stop();
         replay_timing.update_commitment_cache_us += update_commitment_cache_time.as_us();
 
-        Self::push_vote(
-            bank,
-            vote_account_pubkey,
-            identity_keypair,
-            authorized_voter_keypairs,
-            tower,
-            switch_fork_decision,
-            tracked_vote_transactions,
-            *has_new_vote_been_rooted,
-            replay_timing,
-            voting_sender,
-            wait_to_vote_slot,
-        );
+        if should_push_vote {
+            Self::push_vote(
+                bank,
+                vote_account_pubkey,
+                identity_keypair,
+                authorized_voter_keypairs,
+                tower,
+                switch_fork_decision,
+                tracked_vote_transactions,
+                *has_new_vote_been_rooted,
+                replay_timing,
+                voting_sender,
+                wait_to_vote_slot,
+            );
+        }
         Ok(())
     }
 
